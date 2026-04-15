@@ -1,0 +1,46 @@
+# Personal genetic data — NEVER commit. Covers the major consumer-DNA
+# raw-data exports.
+MyHeritage*.csv
+MyHeritage*.txt
+23andMe*.txt
+23andMe*.zip
+AncestryDNA*.txt
+AncestryDNA*.zip
+FTDNA*.csv
+FamilyTreeDNA*.csv
+LivingDNA*.csv
+*_raw_dna_data.*
+genome_*.txt
+*.23andme
+*.Zone.Identifier
+
+# ClinVar snapshot — large and re-downloadable
+clinvar_variant_summary.txt.gz
+clinvar*.txt.gz
+clinvar*.vcf.gz
+
+# Pipeline intermediates and outputs
+candidates.json
+evee_cache.ndjson
+evee_results.json
+evee_results.md
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
