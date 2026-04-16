@@ -2,6 +2,16 @@ name: tests
 on: [push, pull_request]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
   parser:
     runs-on: ubuntu-latest
     strategy:
@@ -13,3 +23,4 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python tests/test_parser.py
+      - run: python tests/test_core.py

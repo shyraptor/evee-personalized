@@ -75,9 +75,15 @@ ignores the file extension — all you need to do is point `--input` at the
 file. You can download your raw data from your testing provider's results
 page (typically labelled "Download DNA data" or similar).
 
-The file is **never uploaded anywhere by this tool**. All parsing and
-filtering runs locally; the only network traffic is anonymized EVEE lookups
-by variant id (`chr:pos:ref:alt`).
+The raw-data file itself is **never uploaded anywhere by this tool** — all
+parsing and filtering runs locally. The only network traffic is EVEE
+`variant_id` lookups of the form `chr:pos:ref:alt`. With the default
+`--carriers-only`, the set of variants queried *is* a subset of your
+genotype at ClinVar-classified loci: collectively, those queries encode
+your pathogenic / likely-pathogenic / VUS carrier status at every queried
+site. EVEE sees and caches each lookup server-side. This tool is not an
+anonymizing proxy; treat it as a side-channel that reveals your genetic
+makeup at the queried loci to Goodfire's backend.
 
 If you have a file in some other layout, the parser will work as long as it
 has columns matching one of the alias sets: `rsid / rs_id / rs / name`,
@@ -99,6 +105,11 @@ curl -O https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/variant_summary.t
 ## Usage
 
 ```bash
+# Sanity-check that the EVEE API is reachable and our coordinate offset is
+# still correct. No local files needed — it queries a single well-known
+# variant and verifies EVEE returns a result at the expected coordinates.
+python3 evee_pipeline.py verify
+
 # One-shot, default filters (non_benign + carriers-only)
 python3 evee_pipeline.py all
 

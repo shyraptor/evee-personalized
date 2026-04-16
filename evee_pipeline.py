@@ -21,6 +21,9 @@ Pipeline modes:
   emit   — read the cache, apply filters, write evee_results.json and
            evee_results.md
   all    — run build, fetch, emit in that order
+  verify — query a single hardcoded well-known variant to sanity-check
+           API connectivity and the ClinVar→EVEE coordinate offset; does
+           not read any local files
 
 Defaults: --carriers-only is on (only variants you carry at least one alt
 allele of) and --filter is non_benign (drops ClinVar benign/LB/B+LB). Widen
@@ -71,7 +74,13 @@ DEFAULT_CONCURRENCY = 8
 DEFAULT_QPS = 15.0
 DEFAULT_MAX_POLL_SECONDS = 300.0
 
-USER_AGENT = "evee-personalized/1.0"
+# Cap on HTTP response body size. EVEE analysis payloads are a few KB; anything
+# approaching 10 MB is a misbehaving upstream (or a user pointing --api-base at
+# something weird) and we'd rather bail than read it into memory.
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+__version__ = "1.1.0"
+USER_AGENT = f"evee-personalized/{__version__}"
 
 
 # ---------- Consumer DNA raw-data CSV parser ----------
@@ -397,8 +406,16 @@ class RateLimiter:
             self.next_slot = now + self.min_interval
 
 
-def http_get_json(url: str, timeout: float = 30.0) -> tuple[int, Any]:
+def http_get_json(
+    url: str,
+    timeout: float = 30.0,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> tuple[int, Any]:
     """GET url, return (status_code, parsed_json_or_raw_string).
+
+    Response bodies are capped at max_bytes to defend against a misbehaving
+    upstream returning unbounded data. An over-cap response is reported as
+    (0, error_string).
 
     Network-level failures are returned as (0, error_string).
     """
@@ -408,14 +425,22 @@ def http_get_json(url: str, timeout: float = 30.0) -> tuple[int, Any]:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
+            # Read one byte past the cap so we can detect overflow.
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                return 0, f"response exceeded max_bytes={max_bytes}"
             code = resp.getcode()
             try:
                 return code, json.loads(data)
             except json.JSONDecodeError:
                 return code, data.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        body = ""
+        if e.fp:
+            try:
+                body = e.read(max_bytes + 1).decode("utf-8", errors="replace")
+            except OSError:
+                pass
         return e.code, body
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return 0, str(e)
@@ -538,9 +563,18 @@ def fetch_evee_analysis(
 
 
 def read_cache(path: Path) -> dict[str, dict[str, Any]]:
+    """Load the resumable NDJSON cache, keyed by variant_id.
+
+    Corrupt or incomplete lines (can happen after a mid-write crash) are
+    counted and reported on stderr — they'll be silently re-queried on the
+    next fetch run, which is the resumable-by-design behavior we want — but
+    the count lets the user notice if it's large enough to indicate a
+    corrupted file worth investigating.
+    """
     if not path.exists():
         return {}
     out: dict[str, dict[str, Any]] = {}
+    corrupt = 0
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -549,8 +583,14 @@ def read_cache(path: Path) -> dict[str, dict[str, Any]]:
             try:
                 rec = json.loads(line)
                 out[rec["variant_id"]] = rec
-            except Exception:
-                continue
+            except (json.JSONDecodeError, KeyError, TypeError):
+                corrupt += 1
+    if corrupt:
+        print(
+            f"  warning: {corrupt} corrupt/incomplete line(s) in {path} "
+            f"(skipped; will be re-queried on next fetch)",
+            file=sys.stderr,
+        )
     return out
 
 
@@ -788,6 +828,91 @@ def _append_md_record(lines: list[str], r: dict) -> None:
     lines.append("")
 
 
+# ---------- verify command ----------
+#
+# A single-variant sanity check that exercises (a) our ClinVar→EVEE
+# coordinate offset, (b) the hardcoded API base URL, and (c) the async
+# polling loop, all without touching any of the user's local files.
+#
+# The reference variant is rs1800896 (IL10 -1082 A>G), which is:
+#   - widely studied (should always be in EVEE's cache)
+#   - on an autosome with unambiguous coordinates
+#   - the same variant shown in the README's sample JSON output
+#
+# If the expected variant_id ever stops matching, either EVEE has changed
+# its coordinate convention or ClinVar has moved the position — in either
+# case we want to surface it loudly rather than silently miscall every
+# variant in a run.
+
+VERIFY_VARIANT = {
+    "rsid": "rs1800896",
+    "chrom": "1",
+    "clinvar_pos_1based": 206773552,
+    "ref": "T",
+    "alt": "C",
+    "expected_variant_id": "chr1:206773551:T:C",
+}
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Sanity-check coordinate offset + API connectivity on a known variant."""
+    v = VERIFY_VARIANT
+    constructed = variant_id_for({
+        "chrom": v["chrom"],
+        "pos": v["clinvar_pos_1based"],
+        "ref": v["ref"],
+        "alt": v["alt"],
+    })
+    print(f"evee-personalized {__version__}")
+    print(f"Sanity-check variant: {v['rsid']} (IL10 promoter)")
+    print(f"  ClinVar 1-based pos: {v['clinvar_pos_1based']}")
+    print(f"  Constructed variant_id: {constructed}")
+    if constructed != v["expected_variant_id"]:
+        print(
+            f"  FAIL  variant_id_for() produced {constructed}, "
+            f"expected {v['expected_variant_id']}. "
+            f"Coordinate-offset logic is broken.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("  PASS  variant_id_for() offset is correct")
+
+    print(f"\nQuerying EVEE at {args.api_base} …")
+    limiter = RateLimiter(args.qps)
+    r = fetch_evee_analysis(constructed, v["rsid"], limiter, args.api_base)
+    status = r.get("status")
+    print(f"  status: {status}")
+
+    if status == "ok":
+        resolved = r.get("resolved_variant_id")
+        found_via = r.get("found_via")
+        body_result = (r.get("body") or {}).get("result") or {}
+        print(f"  resolved_variant_id: {resolved}  (via {found_via})")
+        print(f"  EVEE model:          {body_result.get('model', '?')}")
+        print(f"  EVEE confidence:     {body_result.get('confidence', '?')}")
+        if resolved != constructed:
+            print(
+                f"  WARN  EVEE resolved to a different variant_id than we "
+                f"constructed ({resolved} vs {constructed}). This can happen "
+                f"at multi-allelic sites and is not necessarily a bug, but "
+                f"worth noting."
+            )
+        print("  PASS  API reachable and variant resolves")
+        return
+
+    if status == "not_in_evee":
+        print(
+            "  FAIL  EVEE returned 404 for a well-known variant. Either "
+            "your --api-base is wrong, the API is down, or EVEE's "
+            "coordinate convention has changed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"  FAIL  unexpected status: {status}", file=sys.stderr)
+    sys.exit(1)
+
+
 # ---------- all + CLI ----------
 
 
@@ -808,10 +933,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "mode",
-        choices=["build", "fetch", "emit", "all"],
+        choices=["build", "fetch", "emit", "all", "verify"],
         help=(
             "build: parse CSV + ClinVar; fetch: query EVEE; "
-            "emit: produce JSON/Markdown; all: run all three in order."
+            "emit: produce JSON/Markdown; all: run all three in order; "
+            "verify: query a single known variant to sanity-check the API "
+            "and coordinate offset (no local files required)."
         ),
     )
 
@@ -891,7 +1018,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    {"build": cmd_build, "fetch": cmd_fetch, "emit": cmd_emit, "all": cmd_all}[args.mode](args)
+    dispatch = {
+        "build": cmd_build,
+        "fetch": cmd_fetch,
+        "emit": cmd_emit,
+        "all": cmd_all,
+        "verify": cmd_verify,
+    }
+    dispatch[args.mode](args)
 
 
 if __name__ == "__main__":
